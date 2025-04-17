@@ -2,21 +2,25 @@ import os
 import uuid
 import argparse
 import streamlit as st
-import html  # Added for HTML escaping
+import html
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+# Updated imports for LangChain components
+
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.schema import HumanMessage, AIMessage
-from langchain_community.llms import Ollama  # Added for free model support
+# Updated import for Ollama
+from langchain_ollama import OllamaLLM
 import psycopg2
 from dotenv import load_dotenv
 from datetime import datetime
-import re  # Added for regex pattern matching
+import re
+import time
 
 # Load environment variables
 load_dotenv()
@@ -24,15 +28,24 @@ load_dotenv()
 # Configuration variables
 PDF_PATH = os.getenv("PDF_PATH", r"C:\Users\PRECISION 7770\Downloads\RFP for Integrated Labour Management System - ver 21.2.pdf")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-USE_FREE_MODEL = os.getenv("USE_FREE_MODEL", "false").lower() == "true"
+USE_FREE_MODEL = os.getenv("USE_FREE_MODEL", "true").lower() == "true"
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")  # Default model
+
+# Optional advanced models if available
+ADVANCED_MODEL = os.getenv("ADVANCED_MODEL", "llama3")  # llama3, mixtral, or other advanced models
+
+# Chunk settings - critical for performance
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
+RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "6"))  # Number of chunks to retrieve
 
 # Database configuration
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "work-demo")
 DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "your_password")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "abcd123")
 
 # Function to get database connection
 def get_db_connection():
@@ -47,16 +60,16 @@ def get_db_connection():
 
 # Set page configuration
 st.set_page_config(
-    page_title="PDF AI Assistant", 
+    page_title="Enhanced PDF AI Assistant", 
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
-        'About': "# PDF AI Assistant\nA powerful tool to interact with your PDF documents using AI."
+        'About': "# Enhanced PDF AI Assistant\nA powerful tool to interact with PDF documents using AI."
     }
 )
 
-# Custom CSS for better UI (unchanged)
+# Custom CSS (keeping your existing style)
 st.markdown("""
 <style>
     .main {
@@ -99,22 +112,18 @@ st.markdown("""
     .css-1v3fvcr {
         background-color: #1e1e2e;
     }
-    /* Make input box dark themed */
     .stTextInput input {
         background-color: #2C3E50;
         color: white;
         border: 1px solid #3498DB;
     }
-    /* Style expanders */
     .streamlit-expanderHeader {
         background-color: #2C3E50;
         color: white;
     }
-    /* Change text color to white for better visibility on dark background */
     .stMarkdown, h1, h2, h3, p, span {
         color: white;
     }
-    /* Style tables */
     .ai-table {
         width: 100%;
         border-collapse: collapse;
@@ -136,6 +145,19 @@ st.markdown("""
     .ai-table tr:nth-child(even) {
         background-color: #3d566e;
     }
+    .feedback-buttons {
+        display: flex;
+        justify-content: flex-end;
+        margin-top: 5px;
+    }
+    .feedback-button {
+        background-color: transparent;
+        color: white;
+        border: 1px solid #3498DB;
+        padding: 5px 10px;
+        margin-left: 5px;
+        border-radius: 4px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -154,9 +176,20 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = None
 if "use_free_model" not in st.session_state:
     st.session_state.use_free_model = USE_FREE_MODEL
+if "ollama_model" not in st.session_state:
+    st.session_state.ollama_model = OLLAMA_MODEL
+if "response_times" not in st.session_state:
+    st.session_state.response_times = []
+# Add these variables to track settings changes
+if "current_chunk_size" not in st.session_state:
+    st.session_state.current_chunk_size = CHUNK_SIZE
+if "current_chunk_overlap" not in st.session_state:
+    st.session_state.current_chunk_overlap = CHUNK_OVERLAP
+if "current_retrieval_k" not in st.session_state:
+    st.session_state.current_retrieval_k = RETRIEVAL_K
 
 def extract_text_from_pdf(pdf_path):
-    """Extract complete text from PDF file at the given path"""
+    """Extract complete text from PDF file with improved robustness"""
     try:
         pdf_reader = PdfReader(pdf_path)
         text = ""
@@ -165,12 +198,8 @@ def extract_text_from_pdf(pdf_path):
         # Extract text from each page
         for i, page in enumerate(pdf_reader.pages):
             page_text = page.extract_text()
-            if page_text:  # Only add if text was successfully extracted
+            if page_text:
                 text += page_text + "\n\n"  # Add page breaks for better segmentation
-            
-            # Optional progress indication for large PDFs
-            if total_pages > 50 and i % 10 == 0:
-                print(f"Processed {i}/{total_pages} pages...")
         
         if not text.strip():
             print("Warning: No text was extracted from the PDF. The file might be scanned images or protected.")
@@ -180,21 +209,33 @@ def extract_text_from_pdf(pdf_path):
         print(f"Error reading PDF file: {str(e)}")
         return None, 0
 
+def clean_text(text):
+    """Clean extracted text to improve quality"""
+    # Replace multiple newlines with double newline
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # Replace multiple spaces with single space
+    text = re.sub(r' {2,}', ' ', text)
+    
+    # Fix broken words (some PDFs break words with hyphen at line end)
+    text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)
+    
+    return text
+
 def split_text_into_chunks(text):
-    """Split text into manageable chunks with appropriate overlap for context preservation"""
-    # Increased chunk size substantially to ensure better context
+    """Split text into manageable chunks with improved strategy"""
+    # Using improved chunk size and overlap for better context preservation
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2500,       # Larger chunks for more context
-        chunk_overlap=500,     # Substantial overlap to preserve context
+        chunk_size=st.session_state.current_chunk_size,
+        chunk_overlap=st.session_state.current_chunk_overlap,
         length_function=len,
-        separators=["\n\n", "\n", ".", " ", ""]  # Try to split at natural boundaries first
+        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]  # Better natural boundaries
     )
     
     chunks = text_splitter.split_text(text)
     
     # Verify we're getting reasonable chunks
     if chunks:
-        # Log some diagnostics about the chunks
         avg_chunk_size = sum(len(chunk) for chunk in chunks) / len(chunks)
         print(f"Created {len(chunks)} chunks with average size of {avg_chunk_size:.1f} characters")
     else:
@@ -205,18 +246,11 @@ def split_text_into_chunks(text):
 def create_vector_store(text_chunks):
     """Create vector store with text embeddings"""
     try:
-        # Use a free local embedding model instead of OpenAI
+        # Use a robust embedding model
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-        
-        # Print chunk count for verification
-        print(f"Creating vector store with {len(text_chunks)} chunks")
         
         # Create the vector store
         vector_store = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
-        
-        # Verify vector store creation was successful
-        if vector_store:
-            print("Vector store created successfully")
         
         return vector_store
     except Exception as e:
@@ -224,26 +258,30 @@ def create_vector_store(text_chunks):
         raise
 
 def create_conversation_chain(vector_store):
-    """Create an enhanced conversation chain for comprehensive Q&A across the entire document"""
+    """Create an enhanced conversation chain for comprehensive Q&A"""
     
-    # Set up a more effective retriever with higher top_k to get more context
+    # Set up a more effective retriever with optimized k value
     retriever = vector_store.as_retriever(
-        search_type="similarity",  # Use similarity search
+        search_type="similarity",
         search_kwargs={
-            "k": 7  # Increased to retrieve more chunks for better context
+            "k": st.session_state.current_retrieval_k  # Retrieve more chunks for better context
         }
     )
     
-    # Choose between Google Gemini or Ollama (free, local model)
+    # Choose between Google Gemini or Ollama (free models)
     if st.session_state.use_free_model:
         try:
-            # Try to use local Ollama with Mistral model
-            llm = Ollama(
-                model="mistral",  # A powerful open-source model
+            # Try to use advanced model if available, otherwise fallback to mistral
+            model_to_use = ADVANCED_MODEL if ADVANCED_MODEL and ADVANCED_MODEL != "mistral" else st.session_state.ollama_model
+            
+            # Connect to Ollama
+            llm = OllamaLLM(
+                model=model_to_use,
                 base_url=OLLAMA_HOST,
                 temperature=0.2
             )
-            print("Using FREE Mistral model via Ollama")
+            print(f"Using FREE model: {model_to_use} via Ollama")
+            st.session_state.model_used = f"Ollama - {model_to_use}"
         except Exception as e:
             print(f"Error initializing Ollama: {str(e)}")
             st.warning("Failed to connect to Ollama. Falling back to Google Gemini.")
@@ -252,25 +290,34 @@ def create_conversation_chain(vector_store):
                 google_api_key=GOOGLE_API_KEY,
                 temperature=0.2
             )
+            st.session_state.model_used = "Google Gemini"
     else:
         # Use Google's Gemini
         llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-pro",  # Updated model name
+            model="gemini-1.5-pro",
             google_api_key=GOOGLE_API_KEY,
             temperature=0.2
         )
+        st.session_state.model_used = "Google Gemini"
     
     # Configure memory with the explicit output key
     memory = ConversationBufferMemory(
         memory_key="chat_history",
-        output_key="answer",  # Specify which output to store in memory
+        output_key="answer",
         return_messages=True
     )
     
-    # Configure custom prompt to encourage comprehensive answers with supplementary knowledge
+    # Configure improved prompt template for better answers
     custom_template = """
-    You are an AI assistant that answers questions based on PDF documents.
-    You should provide thorough, comprehensive answers based on the content from the PDF document.
+    You are an expert AI assistant answering questions about this specific PDF document.
+    
+    When answering questions:
+    1. Base your answer DIRECTLY on information in the document
+    2. If the exact answer isn't in the document context, clearly state this
+    3. Use DIRECT QUOTES from the document whenever possible
+    4. Organize information in a clear, structured way
+    5. Maintain the terminology used in the original document
+    6. Be precise with numbers, dates, and technical details from the document
     
     Chat History:
     {chat_history}
@@ -280,16 +327,9 @@ def create_conversation_chain(vector_store):
     
     Question: {question}
     
-    Answer the question as completely as possible using the provided context.
-    If the answer is not fully covered in the context, you can add supplementary information to
-    make your answer more helpful. In these cases, clearly indicate what information comes
-    from outside the document by prefacing with "Additionally:" or similar phrasing.
-    
-    When creating tables or structured content, format it in a clean way with proper HTML table tags.
-    Do not include any closing </div> tags or other HTML tags that could disrupt the formatting.
-    Always close any HTML tags you open.
-    
-    Provide a complete, informative answer that is useful to the user.
+    Provide a thorough answer that directly addresses the question.
+    If creating tables, use proper HTML table tags with the "ai-table" class.
+    Always verify your answer against the document context before responding.
     """
     
     CUSTOM_PROMPT = PromptTemplate(
@@ -303,13 +343,12 @@ def create_conversation_chain(vector_store):
         retriever=retriever,
         memory=memory,
         combine_docs_chain_kwargs={"prompt": CUSTOM_PROMPT},
-        return_source_documents=True,  # Optional: returns source chunks for verification
-        verbose=True  # Helpful for debugging
+        return_source_documents=True,
+        verbose=True
     )
     
     return conversation_chain
 
-# Function to clean and sanitize AI responses
 def sanitize_ai_response(response_text):
     """Clean AI response to prevent HTML rendering issues"""
     # Remove any stray closing div tags
@@ -338,10 +377,13 @@ def sanitize_ai_response(response_text):
     return response_text
 
 def process_user_question(user_question):
-    """Process user question and get comprehensive response from the full document"""
+    """Process user question with improved accuracy and response tracking"""
     if st.session_state.conversation is None:
         st.error("Please process the PDF document first.")
         return
+    
+    # Start timing the response
+    start_time = time.time()
     
     # Load conversation history from database
     if st.session_state.session_id:
@@ -372,6 +414,10 @@ def process_user_question(user_question):
     # Process the question
     response = st.session_state.conversation({"question": user_question})
     
+    # Calculate response time
+    response_time = time.time() - start_time
+    st.session_state.response_times.append(response_time)
+    
     # Get and sanitize the AI response
     answer_text = sanitize_ai_response(response["answer"])
     
@@ -389,10 +435,10 @@ def process_user_question(user_question):
                 (st.session_state.session_id, "human", user_question)
             )
             
-            # Store AI response - ensure we're not truncating the content
+            # Store AI response with response time
             cursor.execute(
-                "INSERT INTO conversation_history (session_id, role, content) VALUES (%s, %s, %s)",
-                (st.session_state.session_id, "ai", answer_text)
+                "INSERT INTO conversation_history (session_id, role, content, query_time) VALUES (%s, %s, %s, %s)",
+                (st.session_state.session_id, "ai", answer_text, response_time)
             )
             
             # Explicitly commit the transaction
@@ -412,29 +458,10 @@ def process_user_question(user_question):
     
     st.session_state.chat_history = history
     
-    return answer_text, response.get("source_documents", [])
-
-def validate_processing(total_chars, total_chunks, total_pages):
-    """Validate that the PDF processing was likely successful"""
-    if total_chars == 0:
-        return False, "No text was extracted from the PDF. The file might be protected or contain only images."
-    
-    # Calculate expected number of chunks based on doc size
-    expected_min_chunks = max(1, total_chars // 5000)  # Very rough estimate
-    
-    if total_chunks < expected_min_chunks:
-        return False, f"Warning: Fewer chunks ({total_chunks}) created than expected for document size. Processing may be incomplete."
-    
-    # Calculate average characters per page
-    avg_chars_per_page = total_chars / total_pages if total_pages > 0 else 0
-    
-    if avg_chars_per_page < 100 and total_pages > 1:
-        return False, f"Warning: Low text content per page ({avg_chars_per_page:.1f} chars/page). Some content may not have been extracted."
-    
-    return True, "PDF processing appears successful."
+    return answer_text, response.get("source_documents", []), response_time
 
 def process_pdf():
-    """Process the entire PDF file at the configured path"""
+    """Process the PDF file with improved text extraction and chunking"""
     if not os.path.exists(PDF_PATH):
         st.error(f"PDF file not found at: {PDF_PATH}")
         return False
@@ -453,44 +480,61 @@ def process_pdf():
         # Add a progress indicator
         progress_bar = st.progress(0)
         
+        # Clean the extracted text
+        progress_text.text("Cleaning and preparing text...")
+        progress_bar.progress(20)
+        cleaned_text = clean_text(raw_text)
+        
         # Show PDF content length information
-        progress_text.text(f"Extracted {len(raw_text)} characters of text from {total_pages} pages")
+        progress_text.text(f"Extracted {len(cleaned_text)} characters of text from {total_pages} pages")
         
         # Process the extracted text
-        progress_text.text("Splitting text into chunks...")
-        progress_bar.progress(30)
-        text_chunks = split_text_into_chunks(raw_text)
+        progress_text.text("Splitting text into optimal chunks...")
+        progress_bar.progress(40)
+        text_chunks = split_text_into_chunks(cleaned_text)
         
         # Create vector store
-        progress_text.text("Creating vector database...")
+        progress_text.text("Creating vector database with embeddings...")
         progress_bar.progress(60)
         st.session_state.vector_store = create_vector_store(text_chunks)
         
         # Create conversation chain
-        progress_text.text("Setting up Q&A system...")
-        progress_bar.progress(90)
+        progress_text.text("Setting up Q&A system with enhanced prompts...")
+        progress_bar.progress(80)
         st.session_state.conversation = create_conversation_chain(st.session_state.vector_store)
-        
-        # Validate processing
-        success, message = validate_processing(len(raw_text), len(text_chunks), total_pages)
-        
-        if not success:
-            st.warning(message)
         
         # Create session in database
         session_id = str(uuid.uuid4())
         conn = get_db_connection()
         try:
-            conn.autocommit = False
             cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO sessions (session_id, pdf_path) VALUES (%s, %s)",
-                (session_id, PDF_PATH)
-            )
+            # Check if the table exists and if total_pages column exists
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.columns 
+                    WHERE table_name = 'sessions' AND column_name = 'total_pages'
+                )
+            """)
+            column_exists = cursor.fetchone()[0]
+
+            if column_exists:
+                cursor.execute(
+                    """INSERT INTO sessions 
+                       (session_id, pdf_path, total_pages, total_chunks, llm_model) 
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (session_id, PDF_PATH, total_pages, len(text_chunks), st.session_state.model_used)
+                )
+            else:
+                # Fallback to a simpler query if the column doesn't exist
+                cursor.execute(
+                    """INSERT INTO sessions 
+                       (session_id, pdf_path, llm_model) 
+                       VALUES (%s, %s, %s)""",
+                    (session_id, PDF_PATH, st.session_state.model_used)
+                )
             conn.commit()
             st.session_state.session_id = session_id
         except Exception as e:
-            conn.rollback()
             st.error(f"Database error: {str(e)}")
         finally:
             cursor.close()
@@ -502,22 +546,16 @@ def process_pdf():
         
         # Save stats
         st.session_state.pdf_stats = {
-            "chars": len(raw_text),
+            "chars": len(cleaned_text),
             "chunks": len(text_chunks),
-            "pages": total_pages
+            "pages": total_pages,
+            "chunk_size": st.session_state.current_chunk_size,
+            "chunk_overlap": st.session_state.current_chunk_overlap
         }
         
         return True
     
     return False
-
-def format_bytes(size):
-    """Format bytes to a readable string"""
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size < 1024.0:
-            return f"{size:.1f} {unit}"
-        size /= 1024.0
-    return f"{size:.1f} TB"
 
 def main():
     # Main layout
@@ -527,30 +565,71 @@ def main():
         st.image("https://cdn-icons-png.flaticon.com/512/2232/2232688.png", width=100)
     
     with col2:
-        st.title("Advanced PDF AI Assistant")
-        st.markdown("Ask questions about your PDF document and get AI-powered answers.")
+        st.title("Enhanced PDF AI Assistant")
+        st.markdown("Ask detailed questions about your PDF document and get accurate AI-powered answers.")
     
     # Sidebar for configuration and controls
     st.sidebar.header("📋 Document Control")
     
-    # New option for free model
+    # Model selection options
     st.session_state.use_free_model = st.sidebar.checkbox(
-        "Use free Mistral model (requires Ollama)",
+        "Use free local model",
         value=st.session_state.use_free_model,
-        help="Use locally hosted Mistral model via Ollama instead of Google Gemini"
+        help="Use locally hosted models via Ollama instead of Google Gemini"
     )
     
     if st.session_state.use_free_model:
-        st.sidebar.info("Using Mistral model via Ollama. Make sure Ollama is running.")
+        # Ollama model selection
+        available_models = ["mistral", "llama3", "mixtral", "phi3", "gemma"]
+        selected_model = st.sidebar.selectbox(
+            "Select Ollama Model",
+            available_models,
+            index=available_models.index(st.session_state.ollama_model) if st.session_state.ollama_model in available_models else 0,
+            help="Choose which model to use with Ollama"
+        )
+        
+        if selected_model != st.session_state.ollama_model:
+            st.session_state.ollama_model = selected_model
+            # Reset conversation if model changed and PDF already processed
+            if st.session_state.pdf_processed:
+                st.sidebar.warning("Model changed! Please re-process the PDF to use the new model.")
+                st.session_state.pdf_processed = False
+        
+        st.sidebar.info(f"Using {selected_model} model via Ollama. Make sure Ollama is running.")
         ollama_url = st.sidebar.text_input("Ollama URL", value=OLLAMA_HOST)
         if ollama_url != OLLAMA_HOST:
             os.environ["OLLAMA_HOST"] = ollama_url
+    
+    # Advanced settings (collapsible)
+    with st.sidebar.expander("Advanced Settings"):
+        new_chunk_size = st.slider("Chunk Size", 500, 3000, st.session_state.current_chunk_size, 100, 
+                                 help="Size of text chunks (larger chunks provide more context, smaller chunks more precision)")
+        new_chunk_overlap = st.slider("Chunk Overlap", 50, 600, st.session_state.current_chunk_overlap, 50,
+                                    help="Overlap between chunks to maintain context")
+        new_retrieval_k = st.slider("Retrieval Count", 2, 10, st.session_state.current_retrieval_k, 1,
+                                  help="Number of chunks to retrieve for each question")
+        
+        # Update settings if changed
+        if (new_chunk_size != st.session_state.current_chunk_size or 
+            new_chunk_overlap != st.session_state.current_chunk_overlap or 
+            new_retrieval_k != st.session_state.current_retrieval_k):
+            
+            if st.button("Apply Settings"):
+                # Update session state settings
+                st.session_state.current_chunk_size = new_chunk_size
+                st.session_state.current_chunk_overlap = new_chunk_overlap
+                st.session_state.current_retrieval_k = new_retrieval_k
+                
+                # Mark for reprocessing
+                if st.session_state.pdf_processed:
+                    st.sidebar.warning("Settings changed! Please re-process the PDF.")
+                    st.session_state.pdf_processed = False
     
     # File information
     st.sidebar.subheader("Current Document")
     st.sidebar.markdown(f"**Path:** {os.path.basename(PDF_PATH)}")
     
-    # Process PDF button with improved styling
+    # Process PDF button
     if not st.session_state.pdf_processed:
         if st.sidebar.button("📄 Process PDF Document", key="process_pdf"):
             if not st.session_state.use_free_model and GOOGLE_API_KEY == "your-google-api-key-here":
@@ -564,7 +643,7 @@ def main():
         if st.sidebar.button("🔄 Re-Process PDF", key="reprocess_pdf"):
             process_pdf()
     
-    # Document statistics
+            # Document statistics
     if st.session_state.pdf_processed:
         st.sidebar.subheader("Document Statistics")
         stats = st.session_state.pdf_stats
@@ -578,6 +657,15 @@ def main():
             st.metric("Text chunks", stats["chunks"])
             avg_chunk_size = stats["chars"] / stats["chunks"] if stats["chunks"] > 0 else 0
             st.metric("Avg. chunk size", f"{avg_chunk_size:.0f} chars")
+        
+        # Model information
+        st.sidebar.subheader("Model Information")
+        st.sidebar.info(f"Using: {st.session_state.model_used}")
+        
+        # Show average response time if available
+        if st.session_state.response_times:
+            avg_time = sum(st.session_state.response_times) / len(st.session_state.response_times)
+            st.sidebar.metric("Avg. response time", f"{avg_time:.2f}s")
         
         # Preview content
         with st.sidebar.expander("Preview Document Content"):
@@ -595,7 +683,7 @@ def main():
         
         if user_question:
             with st.spinner("Thinking..."):
-                answer, source_docs = process_user_question(user_question)
+                answer, source_docs, response_time = process_user_question(user_question)
             
             # Create a container for the chat history
             chat_container = st.container()
@@ -610,8 +698,7 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
                     else:  # AI response
-                        # For AI responses, we'll selectively allow some HTML for tables and formatting
-                        # This is safer than directly using message.content with unsafe_allow_html=True
+                        # For AI responses, we'll selectively allow HTML for tables and formatting
                         ai_content = message.content
                         # Check if there's any HTML in the content
                         if "<table" in ai_content.lower():
@@ -619,6 +706,10 @@ def main():
                             st.markdown(f"""
                             <div class="ai-message">
                                 <strong>AI:</strong> {ai_content}
+                                <div class="feedback-buttons">
+                                    <button class="feedback-button">👍 Helpful</button>
+                                    <button class="feedback-button">👎 Not helpful</button>
+                                </div>
                             </div>
                             """, unsafe_allow_html=True)
                         else:
@@ -626,13 +717,20 @@ def main():
                             st.markdown(f"""
                             <div class="ai-message">
                                 <strong>AI:</strong> {html.escape(ai_content)}
+                                <div class="feedback-buttons">
+                                    <button class="feedback-button">👍 Helpful</button>
+                                    <button class="feedback-button">👎 Not helpful</button>
+                                </div>
                             </div>
                             """, unsafe_allow_html=True)
+                
+                # Show performance data
+                st.caption(f"Response time: {response_time:.2f} seconds")
                 
                 # Show sources if available
                 if source_docs and len(source_docs) > 0:
                     with st.expander("View Source Information"):
-                        st.markdown("The AI used the following sections from your document:")
+                        st.markdown(f"The AI used {len(source_docs)} sections from your document:")
                         for i, doc in enumerate(source_docs):
                             st.markdown(f"**Source {i+1}:**")
                             preview = doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content
@@ -643,33 +741,35 @@ def main():
         
         # Add some explanation of how the tool works
         st.markdown("""
-        ## How this works
+        ## How this tool works
         
         1. **Process your PDF**: This tool extracts all text from your PDF and prepares it for question answering
         2. **Ask questions**: Once processed, you can ask questions about any content in the document
         3. **View sources**: For each answer, you can see which parts of the document were used
+        
         
         ## Features
         
         - Uses advanced AI to provide accurate answers about your document content
         - Maintains conversation context for follow-up questions
         - Shows source information to verify answers
-        - Now supports supplementary information beyond the document
-        - Option to use free Mistral model for better privacy and no API costs
+        - Now supports improved text processing and retrieval
+        - Options to use powerful free models like Mistral, LLaMA 3, Mixtral, and more
         """)
     
     # Footer
     st.sidebar.markdown("---")
-    st.sidebar.caption("PDF AI Assistant v2.1")
-    model_name = "Mistral (Free)" if st.session_state.use_free_model else "Google Gemini"
-    st.sidebar.caption(f"Using LangChain + {model_name}")
+    st.sidebar.caption("Enhanced PDF AI Assistant")
+    model_name = st.session_state.model_used if hasattr(st.session_state, 'model_used') else "AI Model"
+    st.sidebar.caption(f"Using {model_name}")
 
 if __name__ == "__main__":
     # For command line usage
     parser = argparse.ArgumentParser(description="PDF Question Answering Tool")
     parser.add_argument("--pdf_path", type=str, help="Path to the PDF file")
     parser.add_argument("--api_key", type=str, help="Google API Key")
-    parser.add_argument("--use_free_model", action="store_true", help="Use free Mistral model via Ollama")
+    parser.add_argument("--use_free_model", action="store_true", help="Use free model via Ollama")
+    parser.add_argument("--ollama_model", type=str, help="Ollama model to use (mistral, llama3, etc.)")
     
     args = parser.parse_args()
     
@@ -680,5 +780,7 @@ if __name__ == "__main__":
         GOOGLE_API_KEY = args.api_key
     if args.use_free_model:
         st.session_state.use_free_model = True
+    if args.ollama_model:
+        st.session_state.ollama_model = args.ollama_model
     
     main()
