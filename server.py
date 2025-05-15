@@ -8,36 +8,38 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-# Updated imports for LangChain components
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
-# Updated import for Ollama
 from langchain_ollama import OllamaLLM
 from langchain.schema import HumanMessage, AIMessage
 import psycopg2
 from dotenv import load_dotenv
 import re
+import pandas as pd
+import io
+# Import for Word documents
+import docx2txt
 
 # Load environment variables
 load_dotenv()
 
 # Configuration - Using environment variables
-UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploaded_pdfs")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploaded_docs")
 VECTOR_STORE_DIR = os.getenv("VECTOR_STORE_DIR", "vector_stores")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 USE_FREE_MODEL = os.getenv("USE_FREE_MODEL", "true").lower() == "true"
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
-ADVANCED_MODEL = os.getenv("ADVANCED_MODEL", "llama3")  # More powerful option
+ADVANCED_MODEL = os.getenv("ADVANCED_MODEL", "llama3")
 
-# Chunk settings - critical for performance
+# Chunk settings
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "300"))
-RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "6"))  # Number of chunks to retrieve
+RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "6"))
 
 # Database configuration
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -52,8 +54,8 @@ os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Enhanced PDF Q&A API",
-    description="API for processing PDFs and answering questions using advanced AI models",
+    title="Document Q&A API",
+    description="API for processing documents (PDF, Word, Excel) and answering questions using AI",
     version="2.0.0"
 )
 
@@ -79,11 +81,12 @@ class QueryResponse(BaseModel):
     model_used: str
     response_time: float
 
-class PDFUploadResponse(BaseModel):
+class DocumentUploadResponse(BaseModel):
     session_id: str
     message: str
     preview: str
     document_size: int
+    document_type: str
     chunks_created: int
     model_used: str
     processing_time: float
@@ -104,49 +107,76 @@ def get_db_connection():
 
 def clean_text(text):
     """Clean extracted text to improve quality"""
-    # Replace multiple newlines with double newline
     text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    # Replace multiple spaces with single space
     text = re.sub(r' {2,}', ' ', text)
-    
-    # Fix broken words (some PDFs break words with hyphen at line end)
     text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)
-    
     return text
 
-def extract_text_from_pdf(pdf_path):
-    """Extract complete text from PDF file with improved robustness"""
+def extract_text_from_document(doc_path):
+    """Extract text from PDF, Word document, or Excel file"""
+    file_ext = os.path.splitext(doc_path)[1].lower()
+    text = ""
+    total_pages = 0
+    doc_type = "document"
+    
     try:
-        pdf_reader = PdfReader(pdf_path)
-        text = ""
-        total_pages = len(pdf_reader.pages)
-        
-        # Extract text from each page
-        for i, page in enumerate(pdf_reader.pages):
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n\n"  # Add page breaks for better segmentation
-        
+        if file_ext == '.pdf':
+            # Extract from PDF
+            pdf_reader = PdfReader(doc_path)
+            total_pages = len(pdf_reader.pages)
+            for page in pdf_reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n\n"
+            doc_type = "pdf"
+                    
+        elif file_ext in ['.docx', '.doc']:
+            # Extract from Word document
+            text = docx2txt.process(doc_path)
+            # Estimate pages (approx 3000 chars per page)
+            total_pages = max(1, len(text) // 3000)
+            doc_type = "word"
+            
+        elif file_ext in ['.xlsx', '.xls', '.csv']:
+            # Extract from Excel or CSV
+            if file_ext == '.csv':
+                df = pd.read_csv(doc_path)
+            else:
+                df = pd.read_excel(doc_path)
+                
+            # Convert DataFrame to string representation
+            buffer = io.StringIO()
+            df.to_csv(buffer)
+            text = buffer.getvalue()
+            # Count sheets as pages for Excel
+            total_pages = 1
+            if file_ext in ['.xlsx', '.xls']:
+                excel_file = pd.ExcelFile(doc_path)
+                total_pages = len(excel_file.sheet_names)
+            doc_type = "excel"
+            
+        else:
+            return None, 0, "unsupported"
+            
         # Clean the extracted text
         text = clean_text(text)
-        
-        if not text.strip():
-            print("Warning: No text was extracted from the PDF. The file might be scanned images or protected.")
             
-        return text, total_pages
+        if not text.strip():
+            print(f"Warning: No text extracted from {file_ext} file.")
+            
+        return text, total_pages, doc_type
+        
     except Exception as e:
-        print(f"Error reading PDF file: {str(e)}")
-        return None, 0
+        print(f"Error reading document: {str(e)}")
+        return None, 0, None
 
 def split_text_into_chunks(text):
     """Split text into chunks with improved strategy"""
-    # Using optimized chunk size and overlap
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
         length_function=len,
-        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]  # Better natural boundaries
+        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
     )
     
     chunks = text_splitter.split_text(text)
@@ -154,7 +184,6 @@ def split_text_into_chunks(text):
 
 def create_vector_store(text_chunks):
     """Create vector store with text embeddings"""
-    # Use a robust embedding model
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     vector_store = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
     return vector_store
@@ -162,19 +191,15 @@ def create_vector_store(text_chunks):
 def create_conversation_chain(vector_store, use_free_model=USE_FREE_MODEL, model_name=None):
     """Create an enhanced conversation chain for comprehensive Q&A"""
     
-    # Set up retriever with optimized k value
     retriever = vector_store.as_retriever(
-        search_type="similarity",  # Use similarity search
-        search_kwargs={"k": RETRIEVAL_K}  # Retrieve more chunks for better context
+        search_type="similarity",
+        search_kwargs={"k": RETRIEVAL_K}
     )
     
-    # Choose model based on parameters
     if use_free_model:
         try:
-            # Select model to use - prefer specified model, then advanced, then default
             model_to_use = model_name if model_name else ADVANCED_MODEL if ADVANCED_MODEL else OLLAMA_MODEL
             
-            # Connect to Ollama
             llm = OllamaLLM(
                 model=model_to_use,
                 base_url=OLLAMA_HOST,
@@ -191,7 +216,6 @@ def create_conversation_chain(vector_store, use_free_model=USE_FREE_MODEL, model
             )
             model_used = "Google Gemini"
     else:
-        # Use Google's Gemini
         llm = ChatGoogleGenerativeAI(
             model="gemini-1.5-pro",
             google_api_key=GOOGLE_API_KEY,
@@ -199,16 +223,14 @@ def create_conversation_chain(vector_store, use_free_model=USE_FREE_MODEL, model
         )
         model_used = "Google Gemini"
     
-    # Configure memory with explicit output key
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         output_key="answer",
         return_messages=True
     )
     
-    # Configure improved prompt template
     custom_template = """
-    You are an expert AI assistant answering questions about this specific PDF document.
+    You are an expert AI assistant answering questions about this specific document.
     
     When answering questions:
     1. Base your answer DIRECTLY on information in the document
@@ -236,7 +258,6 @@ def create_conversation_chain(vector_store, use_free_model=USE_FREE_MODEL, model
         template=custom_template,
     )
     
-    # Create the conversation chain with the custom prompt
     conversation_chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
         retriever=retriever,
@@ -258,7 +279,6 @@ def get_session(session_id: str, use_free_model=None, model_name=None):
                 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
                 vector_store = FAISS.load_local(vector_store_path, embeddings)
                 
-                # Use provided model preference or default
                 use_model = USE_FREE_MODEL if use_free_model is None else use_free_model
                 model_to_use = model_name if model_name else None
                 
@@ -283,7 +303,6 @@ def get_session(session_id: str, use_free_model=None, model_name=None):
         
         conversation_chain, model_used = create_conversation_chain(vector_store, use_free_model, model_name)
         
-        # Update session with new model
         active_sessions[session_id]["conversation"] = conversation_chain
         active_sessions[session_id]["use_free_model"] = use_free_model
         active_sessions[session_id]["model_name"] = model_name
@@ -292,34 +311,40 @@ def get_session(session_id: str, use_free_model=None, model_name=None):
     return active_sessions[session_id]
 
 # API Endpoints
-@app.post("/upload-pdf/", response_model=PDFUploadResponse)
-async def upload_pdf(
+@app.post("/upload-document/", response_model=DocumentUploadResponse)
+async def upload_document(
     file: UploadFile = File(...),
     use_free_model: bool = Form(USE_FREE_MODEL),
     model_name: Optional[str] = Form(None)
 ):
     """
-    Upload and process a PDF file
+    Upload and process a document (PDF, Word, Excel)
     """
     start_time = time.time()
     
     # Validate file type
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    supported_formats = ['.pdf', '.docx', '.doc', '.xlsx', '.xls', '.csv']
+    
+    if file_ext not in supported_formats:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported file format. Please upload a PDF, Word, or Excel file. Supported formats: {', '.join(supported_formats)}"
+        )
     
     try:
         # Generate a unique session ID
         session_id = str(uuid.uuid4())
         
-        # Save the uploaded PDF
-        pdf_path = os.path.join(UPLOAD_DIR, f"{session_id}.pdf")
-        with open(pdf_path, "wb") as buffer:
+        # Save the uploaded document
+        doc_path = os.path.join(UPLOAD_DIR, f"{session_id}{file_ext}")
+        with open(doc_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Process the PDF
-        raw_text, total_pages = extract_text_from_pdf(pdf_path)
+        # Process the document
+        raw_text, total_pages, doc_type = extract_text_from_document(doc_path)
         if not raw_text:
-            raise HTTPException(status_code=500, detail="Failed to extract text from PDF")
+            raise HTTPException(status_code=500, detail=f"Failed to extract text from {doc_type.upper()} file")
             
         text_chunks = split_text_into_chunks(raw_text)
         
@@ -334,7 +359,8 @@ async def upload_pdf(
         # Store the conversation chain in memory
         active_sessions[session_id] = {
             "conversation": conversation_chain,
-            "pdf_path": pdf_path,
+            "doc_path": doc_path,
+            "doc_type": doc_type,
             "use_free_model": use_free_model,
             "model_name": model_name,
             "model_used": model_used
@@ -343,10 +369,10 @@ async def upload_pdf(
         # Store session in database
         conn = get_db_connection()
         try:
-            conn.autocommit = False  # Use transaction for reliability
+            conn.autocommit = False
             cursor = conn.cursor()
             
-            # Check if the table exists and if total_pages column exists
+            # Check if table structure supports additional columns
             cursor.execute("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.columns 
@@ -360,15 +386,14 @@ async def upload_pdf(
                     """INSERT INTO sessions 
                     (session_id, pdf_path, total_pages, total_chunks, llm_model) 
                     VALUES (%s, %s, %s, %s, %s)""",
-                    (session_id, pdf_path, total_pages, len(text_chunks), model_used)
+                    (session_id, doc_path, total_pages, len(text_chunks), model_used)
                 )
             else:
-                # Fallback to a simpler query if the column doesn't exist
                 cursor.execute(
                     """INSERT INTO sessions 
                     (session_id, pdf_path, llm_model) 
                     VALUES (%s, %s, %s)""",
-                    (session_id, pdf_path, model_used)
+                    (session_id, doc_path, model_used)
                 )
                 
             conn.commit()
@@ -379,30 +404,31 @@ async def upload_pdf(
             cursor.close()
             conn.close()
         
-        # Create a preview of the PDF content
+        # Create a preview of the document content
         preview = raw_text[:500] + "..." if len(raw_text) > 500 else raw_text
         
         processing_time = time.time() - start_time
         
-        return PDFUploadResponse(
+        return DocumentUploadResponse(
             session_id=session_id,
-            message=f"PDF processed successfully with {len(text_chunks)} chunks",
+            message=f"{doc_type.upper()} processed successfully with {len(text_chunks)} chunks",
             preview=preview,
             document_size=len(raw_text),
+            document_type=doc_type.upper(),
             chunks_created=len(text_chunks),
             model_used=model_used,
             processing_time=processing_time
         )
     
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
     finally:
         file.file.close()
 
 @app.post("/query/", response_model=QueryResponse)
-async def query_pdf(request: QueryRequest = Body(...)):
+async def query_document(request: QueryRequest = Body(...)):
     """
-    Ask a question about a processed PDF
+    Ask a question about a processed document
     """
     start_time = time.time()
     
@@ -421,7 +447,6 @@ async def query_pdf(request: QueryRequest = Body(...)):
         # Store the conversation in the database
         conn = get_db_connection()
         try:
-            # Use transaction for reliable storage
             conn.autocommit = False
             cursor = conn.cursor()
             
@@ -440,7 +465,6 @@ async def query_pdf(request: QueryRequest = Body(...)):
                 (request.session_id, "ai", answer_text, response_time)
             )
             
-            # Explicitly commit the transaction
             conn.commit()
             
         except Exception as e:
@@ -501,15 +525,20 @@ async def get_conversation_history(session_id: str):
                 "timestamp": timestamp.isoformat() if timestamp else None
             })
         
-        # Include model info if available
+        # Include model and document info if available
         model_used = "Unknown"
-        if session_id in active_sessions and "model_used" in active_sessions[session_id]:
-            model_used = active_sessions[session_id]["model_used"]
+        doc_type = "Unknown"
+        if session_id in active_sessions:
+            if "model_used" in active_sessions[session_id]:
+                model_used = active_sessions[session_id]["model_used"]
+            if "doc_type" in active_sessions[session_id]:
+                doc_type = active_sessions[session_id]["doc_type"].upper()
         
         return {
             "session_id": session_id, 
             "history": history,
-            "model_used": model_used
+            "model_used": model_used,
+            "document_type": doc_type
         }
     
     except HTTPException:
@@ -561,6 +590,22 @@ async def get_available_models():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching available models: {str(e)}")
 
+@app.get("/supported-formats")
+async def get_supported_formats():
+    """
+    Get list of supported document formats
+    """
+    return {
+        "formats": [
+            {"extension": ".pdf", "type": "PDF", "description": "Portable Document Format"},
+            {"extension": ".docx", "type": "Word", "description": "Microsoft Word Document"},
+            {"extension": ".doc", "type": "Word", "description": "Microsoft Word Document (Legacy)"},
+            {"extension": ".xlsx", "type": "Excel", "description": "Microsoft Excel Spreadsheet"},
+            {"extension": ".xls", "type": "Excel", "description": "Microsoft Excel Spreadsheet (Legacy)"},
+            {"extension": ".csv", "type": "CSV", "description": "Comma-Separated Values"}
+        ]
+    }
+
 @app.get("/health")
 async def health_check():
     """
@@ -569,6 +614,7 @@ async def health_check():
     return {
         "status": "ok", 
         "default_model": f"Ollama - {OLLAMA_MODEL}" if USE_FREE_MODEL else "Google Gemini",
+        "supported_formats": ["PDF", "Word", "Excel", "CSV"],
         "chunk_settings": {
             "size": CHUNK_SIZE,
             "overlap": CHUNK_OVERLAP,

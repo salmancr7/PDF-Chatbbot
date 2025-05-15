@@ -35,11 +35,12 @@ def init_db(recreate_tables=False):
             cursor.execute("DROP TABLE IF EXISTS sessions CASCADE")
             print("Tables dropped successfully")
         
-        # Create sessions table
+        # Create sessions table with document_type field
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id VARCHAR(36) PRIMARY KEY,
             pdf_path VARCHAR(255) NOT NULL,
+            document_type VARCHAR(20) DEFAULT 'pdf',
             total_pages INTEGER DEFAULT 0,
             total_chunks INTEGER DEFAULT 0,
             embedding_model VARCHAR(100) DEFAULT 'all-MiniLM-L6-v2',
